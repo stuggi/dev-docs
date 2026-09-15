@@ -63,6 +63,12 @@ conversion happens the API version marked as the storage version is what will be
 service operators query KeystoneAPI to ensure the status is complete it would need to be the latest
 v1beta2 API version.
 
+## Versioning shared test helpers
+
+The same applies to the reusable functional-test helpers an operator ships (e.g. `api/test/helpers`), which other operators import to create and read a Kind's CRs. Keep a single helper function per Kind pointing at the current (latest/storage) version rather than keeping old-version variants around — consumers must adopt the new version anyway (see above), so the helper should not let them stick to the old one. When the Kind is bumped, switch its helper functions in place to the new version. The helper bump is then just another one of the API-reference updates described above and is coordinated with them across the consuming repos (it is a breaking change to those consumers, so it lands together with their move to the new version).
+
+The one exception is a no-op preparation bump like this reference implementation, where there are no new fields to exercise and the conversion webhook already serves every consumer the old version transparently. There, leave the helpers on the old version so the existing suites keep exercising the conversion path, and switch them when a real field lands.
+
 # Service Accounts concerns
 
 Most service operators in openstack-k8s-operators have code in them to create restricted service accounts (SAs) used to deploy the openstack services themselves. These SAs are created through lib-common (`modules/common/serviceaccount`, via `common_rbac.ReconcileRbac`) which sets a **controller owner reference** on the SA pointing back at the CRD instance, using `controllerutil.SetControllerReference`. That owner reference carries an `apiVersion`, which is whatever version the reconciler currently operates on (e.g. `.../v1beta1`). When the CRD is bumped to a new version this raises the question of what happens to owner references that were written under the old version. The rest of this section answers that.
@@ -112,13 +118,58 @@ If you do add explicit handling, **patch the owner ref in place** — do **not**
 
 If the CRD version is exposed via the OpenStackControlplane CRD then a new version of OpenStackControlplane will also need to be created. See above section on size concerns. In general the CRD of the OpenStackControlplane works the same as service operators except there is generally no service account concerns.
 
+## Reuse the service operator's conversion code for the bubbled-up spec
+
+OpenStackControlPlane embeds each service's spec as a sub-field (`spec.keystone.template`, `spec.glance.template`, ...). What it embeds is the service's `*SpecCore` type (e.g. `KeystoneAPISpecCore`) — the same "core" spec, minus operator-only fields like `ContainerImage`, that the service operator also shares for defaulting and validation. When OpenStackControlPlane is bumped to a new version, converting it means converting every embedded service spec. If each of those is re-implemented field-by-field inside openstack-operator, the OpenStackControlPlane conversion becomes enormous, duplicates logic that already lives in the service operators, and drifts from them on every service field change.
+
+Handle this the same way defaulting and validation are already shared: the conversion implementation stays in the service operator, and openstack-operator only calls it. Concretely, factor the service operator's Hub/Spoke conversion so that the spec mapping is an **exported** function on the bubble-up unit (the `*SpecCore` type), and the object-level `ConvertTo`/`ConvertFrom` is a thin wrapper that adds ObjectMeta/Status around it. The keystone reference already isolates this mapping in `specCore*` helpers on `KeystoneAPISpecCore`; exporting them is what makes them reusable. OpenStackControlPlane's own conversion then calls each service's exported per-`*SpecCore` converter for the corresponding embedded template — exactly as the OpenStackControlPlane webhook already calls each service's `Default()`/validate functions today. The field-by-field logic then exists once, in the service operator, as the single source of truth for both the service CRD's own conversion and the control plane's.
+
+## A consumer must write the storage version, or it hot-loops
+
+A subtle but important consequence for any operator that *creates* a service CR whose CRD was version-bumped: write it as the **storage (hub) version**. openstack-operator reconciles each service CR with `controllerutil.CreateOrPatch`, which does GET → mutate → diff (before vs after, via `runtime.DefaultUnstructuredConverter.ToUnstructured` + `reflect.DeepEqual`, excluding status) → patch-if-changed. If the consumer still uses the *old* (spoke) Go types after the CRD's storage version moved on, every write goes through the conversion webhook: what it PUTs as v1beta1 is stored as v1beta2 and read back through `ConvertFrom`, so the object it GETs next reconcile is a round-tripped copy. Unless that spoke→hub→spoke round-trip is perfectly idempotent for every field, `before != after` on each reconcile, `CreateOrPatch` returns `Updated`, and the CR is patched forever — a hot loop that also churns the service operator (which reconciles each patch) and bumps `metadata.generation` every second.
+
+This showed up concretely after the KeystoneAPI bump: openstack-operator kept writing `keystonev1beta1.KeystoneAPI` against v1beta2 storage, and both operators reconciled ~once/second with a stable spec but ever-increasing generation. The managedFields told the story — manager `manager` owned `spec` at `v1beta1` and `status` at `v1beta2` on the same object.
+
+The fix is to have the consumer operate on the storage version. Two options:
+
+- **Bump the consumer's own CRD too** (the full pattern — see [Reuse the service operator's conversion code](#reuse-the-service-operators-conversion-code-for-the-bubbled-up-spec) above). OpenStackControlPlane gains a v1beta2, `spec.keystone.template` becomes `keystonev1beta2.KeystoneAPISpecCore`, and `ReconcileKeystoneAPI` builds a `keystonev1beta2.KeystoneAPI` directly. The OSCP conversion delegates the template field to the exported `keystonev1beta1.SpecCoreToV1beta2` / `SpecCoreFromV1beta2`.
+- **Convert at the write boundary only** (minimal fix, no OSCP bump): keep `spec.keystone.template` as v1beta1 but build a `keystonev1beta2.KeystoneAPI` in `ReconcileKeystoneAPI`, converting the template with `keystonev1beta1.SpecCoreToV1beta2(*instance.Spec.Keystone.Template)` before the `CreateOrPatch`. This alone stops the loop, because the diff is now computed against the storage version with no webhook round-trip.
+
+Either way the rule is the same: **the type you hand to `CreateOrPatch` must be the CRD's storage version.** Writing a served-but-non-storage version through a conversion webhook on a reconcile loop is the trap.
+
 # Enabling webhooks in openstack-operator
 
-In general most service operators have webhooks disabled when deployed via openstack-operator. If
-and when an API conversion is needed it is necessary to enable the service operator webhooks in the
-openstack operator's code base. This will involve edits to controllers/operator/openstack\_controller.go
-and hack/sync-bindata.sh. After these edits running a 'make bindata' should show the newly activated
-webhooks getting staged in the bindata directory for deployment.
+In general most service operators have webhooks disabled when deployed via openstack-operator (`ENABLE_WEBHOOKS=false`), and only infra-operator and openstack-baremetal-operator run with them enabled. When enabling webhooks for a conversion it is important to treat two independent concerns separately, because a conversion webhook is not like a validating/defaulting webhook:
+
+- **Webhook server + serving cert + conversion endpoint (mandatory, everywhere).** A conversion webhook is served by the CRD's `spec.conversion.webhook` and is enforced by the kube-apiserver at the storage layer: the moment a CRD has more than one served version, every read/write/list that needs a non-storage version calls the `/convert` endpoint. Unlike validating/defaulting (an optional admission step that simply does not run when disabled), if no backend serves `/convert` with a trusted CA, *all* operations on that CRD fail. So every operator with a version-bumped CRD must run a webhook server with a serving cert and CA injection, regardless of whether its validating/defaulting webhooks are enabled. This is the concern `ENABLE_WEBHOOKS` currently gates on the deployment side (cert mount, `--webhook-cert-path`) and it becomes mandatory for any converted CRD.
+- **Validating/defaulting webhook configs (optional, per-operator).** Whether to *also* install and serve the MutatingWebhookConfiguration/ValidatingWebhookConfiguration is a separate decision that depends on the operator. infra-operator and openstack-baremetal-operator enable them because end users create those CRs directly. For the other service operators the CRs are created by the OpenStackControlPlane reconciler, whose own webhook already validates upstream, so their validating/defaulting webhooks stay off even after conversion is enabled. Enabling conversion does not require turning these on.
+
+The practical consequence is that `ENABLE_WEBHOOKS` today does double duty — it gates both the webhook server/cert *and* validating/defaulting registration. These two must be decided separately: the server/cert half is mandatory for any converted CRD (see "Conversion activation is data-driven off the CRD" below), while the validating/defaulting half stays per-operator. Tying both to "the bundle declares any webhook" would wrongly install validating/defaulting configs for a converted operator like keystone, even though its CRs come via the OpenStackControlPlane. Longer term, once every version-bumped operator serves conversion, the server/cert half of `ENABLE_WEBHOOKS` is on everywhere and the flag can be reduced to (or replaced by) a narrower per-operator switch for the validating/defaulting configs.
+
+## Conversion activation is data-driven off the CRD
+
+Conversion activation must be **derived from the CRD, not gated by a separate deployment switch.** openstack-operator turns on the webhook server, serving cert and CA injection **when the deployed CRD carries a conversion section** (`spec.conversion.strategy: Webhook`, i.e. the CRD has more than one served version), for these reasons:
+
+- **Conversion cannot be toggled off at runtime.** It is enforced by the kube-apiserver: the moment a CRD has a non-storage served version, every read/write of that version *must* go through `/convert`. Turning the endpoint off while the CRD still advertises two versions breaks all operations on that CRD. There is no safe "two versions wired but conversion disabled" state.
+- **The only dormant state is single-version, and it is automatic.** With one version there is nothing to convert, controller-runtime registers no `/convert` handler, and the CRD strategy stays `None`. Nothing is needed to keep conversion "off" before it is needed — adding the second version *is* the flip.
+- **The CRD is the single source of truth.** Whether an operator serves conversion is fully determined by "does its CRD carry a conversion section". Any separate switch alongside it could only duplicate that fact and drift from it (switch off + CRD says `Webhook` → `/convert` unserved → all requests fail; switch on + single version → a server/cert running for nothing).
+
+This means the conversion **infrastructure** (an always-on webhook server + serving cert in every operator, plus openstack-operator's generic CA injection and cert wiring) can and should be built once and uniformly ahead of need, so that a real version bump on any operator is just "add the version + conversion code", with no new integration and no per-operator divergence — while the conversion endpoint itself stays naturally dormant until a second version exists.
+
+Enabling webhooks involves edits to controllers/operator/openstack\_controller.go and hack/sync-bindata.sh. After these edits running a 'make bindata' should show the newly activated webhooks getting staged in the bindata directory for deployment.
+
+## Defaulting is not applied during conversion
+
+Conversion and admission are separate stages of the kube-apiserver pipeline, and a conversion never triggers the defaulting/mutating admission webhook. The conversion webhook runs on read/list/watch/write and only reshapes the object (your `ConvertTo`/`ConvertFrom`); the defaulting webhook (the Go `Default()` method) runs *only* in the admission chain — create/update/patch — against the version the client submitted. Converting or reading an existing object as the new version does not run `Default()`.
+
+The consequence for a version bump that introduces new defaults:
+
+- **Go webhook defaults (`Default()`)** are NOT applied when an existing stored object is converted/read as the new version. They are applied only the next time that CR is written (create/update/patch), or via an explicit storage migration. So a no-op read of an old object as the new hub version will not carry them.
+- **CRD schema defaults (`+kubebuilder:default=`)** are applied by the apiserver itself — on write, and on read for the served version — independent of any webhook. Because we make the latest version the hub/storage version, these get applied when serving the new version.
+
+For a lossless hub object, set any new-version default either as a CRD schema default or explicitly in `ConvertTo`/`ConvertFrom`. Do not rely on the mutating webhook to backfill defaults through conversion — it will not run.
+
+This is also a reason a service operator may want its **own** defaulting webhook enabled, rather than relying solely on the OpenStackControlPlane layer as today. Currently most service operators run with `ENABLE_WEBHOOKS=false` and their CRs are defaulted upstream when the OpenStackControlPlane reconciler templates and creates them; the service operator never defaults the CR itself. That covers the OSCP-created path, but it does not cover defaults that must apply at the service-CR boundary — new-version Go defaults on an already-existing CR (which conversion won't run) or a CR edited outside the exact OSCP path. If a version bump adds defaulting logic that must land on the service CR directly, enable the service operator's defaulting webhook (the validating/defaulting half of the two concerns above) instead of expressing it only at the control-plane level. Expressing the default as a CRD schema default avoids the need for a running webhook entirely and is preferable when the default is a static value.
 
 
 # Timing of CRD conversion with regards to OpenStack minor updates
