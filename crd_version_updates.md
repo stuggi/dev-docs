@@ -114,6 +114,8 @@ If you do add explicit handling, **patch the owner ref in place** — do **not**
 - A separate "runtime validation" that re-checks owner refs every reconcile is redundant — the normal `SetControllerReference` call on every reconcile already is that safety net, and it also covers SAs restored from backup or created by an older operator.
 - The only extra thing to remember is the guardrail above: sequence any future removal of a served CRD version *after* owner refs have converged.
 
+This guidance was validated by envtest in `keystone-operator/test/functional/keystoneapi_ownerref_test.go`. The three specs confirm: (1) a pre-bump stale SA owner ref self-heals to the new storage version on the next reconcile via the existing `serviceaccount.go:62` path; (2) repeated reconciles are a no-op once converged; (3) a deleted SA is recreated with the current storage version ref. No bespoke patch helper was added — `lib-common/modules/common/serviceaccount/serviceaccount.go:62` is the canonical and sufficient implementation. Note: the envtest requires the controller to already be operating on the new version (the new storage version type must be wired into the controller), so it belongs after the version and conversion code exist.
+
 # Bumping the OpenStackControlplane CRD
 
 If the CRD version is exposed via the OpenStackControlplane CRD then a new version of OpenStackControlplane will also need to be created. See above section on size concerns. In general the CRD of the OpenStackControlplane works the same as service operators except there is generally no service account concerns.
@@ -156,7 +158,57 @@ Conversion activation must be **derived from the CRD, not gated by a separate de
 
 This means the conversion **infrastructure** (an always-on webhook server + serving cert in every operator, plus openstack-operator's generic CA injection and cert wiring) can and should be built once and uniformly ahead of need, so that a real version bump on any operator is just "add the version + conversion code", with no new integration and no per-operator divergence — while the conversion endpoint itself stays naturally dormant until a second version exists.
 
-Enabling webhooks involves edits to controllers/operator/openstack\_controller.go and hack/sync-bindata.sh. After these edits running a 'make bindata' should show the newly activated webhooks getting staged in the bindata directory for deployment.
+## Repeatable process for enabling a service operator's conversion webhook
+
+The openstack-operator plumbing (implemented in OSPRH-30210) is fully generic and data-driven. **No openstack-operator code change is needed when a new service operator gains a conversion webhook.** The only required steps are in the service operator and in `go.mod`.
+
+### Step 1 — Service operator: add the second version and conversion plumbing
+
+In the service operator repository, on a `crd_update` branch (see OSPRH-30211 for the keystone reference):
+
+1. Scaffold the new API version and implement the Hub/Spoke conversion methods (`ConvertTo` / `ConvertFrom`).
+2. Enable the conversion webhook and cert-manager CA-injection kustomize patches (`config/crd/patches/webhook_in_<crd>.yaml`, `cainjection_in_<crd>.yaml`; enable them in `config/crd/kustomization.yaml`).
+3. Regenerate manifests (`make manifests`) and push the branch. CI builds and pushes `<operator>-operator-bundle:<commit-sha>`.
+
+### Step 2 — openstack-operator: update the dependency
+
+**After the service operator change merges**, bump the dependency version normally (`go get` or let the renovate bot propose a PR). `pin-bundle-images.sh` extracts the SHA from the module's pseudo-version and pulls the matching bundle.
+
+**For pre-merge integration testing** (before the branch merges), add a temporary `replace` directive in both `go.mod` and `api/go.mod` pointing at the pushed commit on the fork:
+
+```
+replace github.com/openstack-k8s-operators/<op>-operator/api => github.com/<fork>/<op>-operator/api <full-sha>
+```
+
+Run `make tidy` to resolve the pseudo-version, then proceed to step 3. Remove the `replace` once the service operator lands and the normal dependency bump is merged.
+
+### Step 3 — Run `make bindata`
+
+```bash
+IMAGENAMESPACE=<quay-namespace> make bindata
+```
+
+`pin-bundle-images.sh` extracts the commit SHA from the `go.mod` replace directive, queries quay.io for the matching bundle tag, and `skopeo` pulls the bundle. `sync-bindata.sh` then:
+
+- Detects that the operator's CRD carries `spec.conversion.strategy: Webhook` (via `csv_has_conversion_crd`).
+- Writes `bindata/operator/<op>-operator-webhooks.yaml` containing the webhook **Service** and serving **Certificate** only (no admission webhook configs, since the CRs are managed by OpenStackControlPlane upstream).
+- Updates `bindata/crds/<op>.openstack.org_<resource>.yaml` with the two-version CRD including the conversion section.
+
+### What activates automatically (no code change)
+
+Once `bindata/operator/<op>-operator-webhooks.yaml` exists, on the next reconcile:
+
+- **`applyOperator`** — `webhookOperatorSet` (loaded once at startup from the glob of `bindata/operator/*-webhooks.yaml`) includes the new operator. The `default:` case in the `ENABLE_WEBHOOKS` switch sets `ENABLE_WEBHOOKS=true`, so the manager deployment mounts the serving cert and starts the webhook server.
+- **`checkServiceEndpoints`** — `webhookServiceNames()` derives `<op>-operator-webhook-service` from the same set and waits for the endpoint to become ready before proceeding.
+- **cert-manager** — CA injection is handled by OSPRH-30208 (targeting the serving cert this process creates). The CRD's conversion `clientConfig.caBundle` is populated by cert-manager once the cert exists.
+
+### Verify
+
+Run `./hack/test-bindata-webhooks.sh` after `make bindata` to assert that:
+- `bindata/operator/<op>-operator-webhooks.yaml` exists with Service + Certificate (no admission configs).
+- infra/baremetal webhook manifests are unchanged (no regression).
+
+The kuttl integration test (openstack-operator `test/functional/ctlplane`) validates that the operator Deployment has `ENABLE_WEBHOOKS=true`, the webhook endpoint becomes ready, and the serving cert secret is created. This test runs jointly with OSPRH-30208/30209 once all three tickets land.
 
 ## Defaulting is not applied during conversion
 
